@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Bilibili 评论增强 - IP属地 & 粉丝数
 // @namespace    biliip
-// @version      2.2.1
+// @version      2.3.0
 // @description  在 Bilibili 评论区显示用户 IP 属地和粉丝数量，支持独立开关
 // @author       biliip
 // @match        https://*.bilibili.com/*
@@ -396,6 +396,110 @@
                 background: color-mix(in srgb, var(--be-fan-base) 20%, transparent);
                 transform: translateY(-1px);
             }
+            .be-row-actions {
+                display: flex;
+                gap: 6px;
+                margin-left: auto;
+            }
+            .be-row-actions .be-export-btn { margin-left: 0; }
+
+            /* ── 收藏管理面板 ── */
+            #be-fav-overlay {
+                position: fixed;
+                inset: 0;
+                background: rgba(0,0,0,.45);
+                z-index: 100001;
+                display: none;
+                align-items: center;
+                justify-content: center;
+                padding: 16px;
+            }
+            #be-fav-overlay.be-open { display: flex; }
+            #be-fav-panel {
+                width: min(560px, 94vw);
+                max-height: 82vh;
+                display: flex;
+                flex-direction: column;
+                background: color-mix(in srgb, var(--be-panel-bg) 96%, var(--be-fan-base) 4%);
+                border: 0.5px solid color-mix(in srgb, var(--be-fan-base) 22%, transparent);
+                border-radius: 14px;
+                overflow: hidden;
+                box-shadow: 0 12px 40px rgba(0,0,0,.28);
+            }
+            .be-fav-title {
+                display: flex;
+                align-items: center;
+                justify-content: space-between;
+                padding: 14px 18px;
+                font-size: 14px;
+                font-weight: 600;
+                color: color-mix(in srgb, var(--be-text) 90%, transparent);
+                border-bottom: 0.5px solid color-mix(in srgb, var(--be-fan-base) 16%, transparent);
+            }
+            #be-fav-close {
+                border: none;
+                background: transparent;
+                font-size: 20px;
+                line-height: 1;
+                color: color-mix(in srgb, var(--be-fan-base) 80%, var(--be-text) 20%);
+                cursor: pointer;
+                padding: 2px 6px;
+                border-radius: 6px;
+            }
+            #be-fav-close:hover { color: var(--be-text); background: color-mix(in srgb, var(--be-fan-base) 14%, transparent); }
+            .be-fav-list {
+                overflow: auto;
+                padding: 12px 16px 16px;
+                font-size: 13px;
+            }
+            .be-fav-empty {
+                text-align: center;
+                color: color-mix(in srgb, var(--be-fan-base) 70%, var(--be-text) 30%);
+                padding: 40px 0;
+            }
+            .be-fav-item {
+                padding: 12px 14px;
+                border: 0.5px solid color-mix(in srgb, var(--be-fan-base) 16%, transparent);
+                border-radius: 10px;
+                margin-bottom: 10px;
+                background: color-mix(in srgb, var(--be-panel-bg) 70%, transparent);
+            }
+            .be-fav-item-meta {
+                font-size: 12px;
+                color: color-mix(in srgb, var(--be-fan-base) 65%, var(--be-text) 35%);
+                margin-bottom: 6px;
+            }
+            .be-fav-item-content {
+                color: color-mix(in srgb, var(--be-text) 88%, transparent);
+                line-height: 1.6;
+                margin-bottom: 10px;
+                word-break: break-word;
+                display: -webkit-box;
+                -webkit-line-clamp: 4;
+                -webkit-box-orient: vertical;
+                overflow: hidden;
+            }
+            .be-fav-item-actions {
+                display: flex;
+                gap: 12px;
+                align-items: center;
+            }
+            .be-fav-open {
+                color: #00aeec;
+                text-decoration: none;
+                font-size: 12px;
+            }
+            .be-fav-open:hover { text-decoration: underline; }
+            .be-fav-del {
+                border: none;
+                background: transparent;
+                color: #ef5350;
+                font-size: 12px;
+                cursor: pointer;
+                padding: 2px 4px;
+                border-radius: 4px;
+            }
+            .be-fav-del:hover { background: rgba(239,83,80,.12); }
         `;
         document.head.appendChild(style);
     }
@@ -862,6 +966,91 @@
         showFavToast('已导出：' + filename);
     }
 
+    /** 收藏管理面板（查看 / 打开 / 删除） */
+    let favPanelEl = null;
+
+    function ensureFavPanel() {
+        if (favPanelEl) return favPanelEl;
+        const overlay = document.createElement('div');
+        overlay.id = 'be-fav-overlay';
+        overlay.innerHTML = `
+            <div id="be-fav-panel">
+                <div class="be-fav-title">
+                    <span id="be-fav-title-text">我的收藏</span>
+                    <button id="be-fav-close" title="关闭">×</button>
+                </div>
+                <div id="be-fav-list" class="be-fav-list"></div>
+            </div>`;
+        document.body.appendChild(overlay);
+
+        overlay.addEventListener('click', (e) => {
+            if (e.target === overlay) closeFavPanel();
+        });
+        overlay.querySelector('#be-fav-close').addEventListener('click', closeFavPanel);
+        overlay.querySelector('#be-fav-list').addEventListener('click', (e) => {
+            const del = e.target.closest('.be-fav-del');
+            if (del) removeFavorite(del.getAttribute('data-id'));
+        });
+        document.addEventListener('keydown', (e) => {
+            if (e.key === 'Escape') closeFavPanel();
+        });
+        favPanelEl = overlay;
+        return overlay;
+    }
+
+    async function openFavoritesPanel() {
+        const overlay = ensureFavPanel();
+        overlay.classList.add('be-open');
+        await renderFavoritesList();
+    }
+
+    function closeFavPanel() {
+        const o = document.getElementById('be-fav-overlay');
+        if (o) o.classList.remove('be-open');
+    }
+
+    async function renderFavoritesList() {
+        const overlay = ensureFavPanel();
+        const listEl = overlay.querySelector('#be-fav-list');
+        const title = overlay.querySelector('#be-fav-title-text');
+        const list = await favGetAll();
+        title.textContent = '我的收藏 (' + list.length + ')';
+        if (!list.length) {
+            listEl.innerHTML = '<div class="be-fav-empty">还没有收藏的评论</div>';
+            return;
+        }
+        listEl.innerHTML = list.map(r => {
+            const savedAt = r.saved_at ? new Date(r.saved_at).toLocaleString('zh-CN') : '';
+            const ctime = r.ctime ? new Date(r.ctime * 1000).toLocaleString('zh-CN') : '';
+            const uname = (r.uname || '匿名').replace(/</g, '&lt;');
+            const content = (r.content || '').replace(/</g, '&lt;');
+            const page = (typeof r.page === 'string' && r.page) ? r.page : '';
+            const id = (r.id || '').replace(/"/g, '&quot;');
+            const openTag = page
+                ? `<a class="be-fav-open" href="${page}" target="_blank" rel="noopener">打开原评论</a>`
+                : '';
+            return `<div class="be-fav-item">
+                <div class="be-fav-item-meta">${uname} · 评论于 ${ctime} · 收藏于 ${savedAt}</div>
+                <div class="be-fav-item-content">${content}</div>
+                <div class="be-fav-item-actions">
+                    ${openTag}
+                    <button class="be-fav-del" data-id="${id}">删除</button>
+                </div>
+            </div>`;
+        }).join('');
+    }
+
+    async function removeFavorite(id) {
+        try {
+            await favDelete(id);
+            favoriteIdSet.delete(id);
+            await renderFavoritesList();
+            showFavToast('已删除收藏');
+        } catch (e) {
+            showFavToast('删除失败：' + ((e && e.message) || e));
+        }
+    }
+
     /** 设置收藏按钮的已收藏视觉状态 */
     function setFavButtonState(btn, faved) {
         const svg = btn.querySelector('svg');
@@ -1018,8 +1207,11 @@
                 </label>
             </div>
             <div class="be-row">
-                <span class="be-row-label">导出收藏</span>
-                <button type="button" id="be-export-fav" class="be-export-btn">导出</button>
+                <span class="be-row-label">收藏管理</span>
+                <div class="be-row-actions">
+                    <button type="button" id="be-view-fav" class="be-export-btn">查看</button>
+                    <button type="button" id="be-export-fav" class="be-export-btn">导出</button>
+                </div>
             </div>
         `;
 
@@ -1068,6 +1260,11 @@
             settings.enableFavorite = this.checked;
             saveSettings(settings);
             applyVisibility();
+        });
+
+        // 查看收藏
+        panel.querySelector('#be-view-fav').addEventListener('click', function () {
+            openFavoritesPanel();
         });
 
         // 导出收藏
