@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Bilibili 评论增强 - IP属地 & 粉丝数
 // @namespace    biliip
-// @version      2.2.0
+// @version      2.2.1
 // @description  在 Bilibili 评论区显示用户 IP 属地和粉丝数量，支持独立开关
 // @author       biliip
 // @match        https://*.bilibili.com/*
@@ -738,7 +738,6 @@
                 r.onsuccess = () => resolve(r.result || []);
                 r.onerror = () => reject(r.error);
             });
-            db.close();
             return list;
         } catch (_) { return []; }
     }
@@ -753,7 +752,6 @@
             tx.onerror = () => reject(tx.error);
             tx.onabort = () => reject(tx.error);
         });
-        db.close();
     }
 
     /** 删除单条收藏记录 */
@@ -766,7 +764,6 @@
             tx.onerror = () => reject(tx.error);
             tx.onabort = () => reject(tx.error);
         });
-        db.close();
     }
 
     function hasFsAccessApi() {
