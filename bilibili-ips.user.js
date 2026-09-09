@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Bilibili 评论增强 - IP属地 & 粉丝数
 // @namespace    biliip
-// @version      2.3.1
+// @version      2.3.2
 // @description  在 Bilibili 评论区显示用户 IP 属地和粉丝数量，支持独立开关
 // @author       biliip
 // @updateURL   https://raw.githubusercontent.com/0xlxx/bilibili-extension/main/bilibili-ips.user.js
@@ -895,6 +895,19 @@
         return location.href;
     }
 
+    /** 打开原评论时规范化链接：老收藏若不带锚点，尝试用 BVID + id 重建 */
+    function normalizeRecordUrl(record) {
+        const page = record && record.page;
+        if (page && /comment_root_id=/.test(page) && /#reply/.test(page)) return page;
+        const vid = (page || '').match(/\/video\/([A-Za-z0-9]+)/);
+        const rpid = record && record.id ? String(record.id) : '';
+        if (vid && rpid) {
+            return location.origin + '/video/' + vid[1] +
+                '?comment_on=1&comment_root_id=' + rpid + '&share_tag=s_i#reply' + rpid;
+        }
+        return page || '';
+    }
+
     function buildFavoriteRecord(data) {
         return {
             id: commentUniqueId(data),
@@ -1038,7 +1051,7 @@
             const ctime = r.ctime ? new Date(r.ctime * 1000).toLocaleString('zh-CN') : '';
             const uname = (r.uname || '匿名').replace(/</g, '&lt;');
             const content = (r.content || '').replace(/</g, '&lt;');
-            const page = (typeof r.page === 'string' && r.page) ? r.page : '';
+            const page = normalizeRecordUrl(r);
             const id = (r.id || '').replace(/"/g, '&quot;');
             const openTag = page
                 ? `<a class="be-fav-open" href="${page}" target="_blank" rel="noopener">打开原评论</a>`
