@@ -4,6 +4,8 @@
 // @version      2.3.0
 // @description  在 Bilibili 评论区显示用户 IP 属地和粉丝数量，支持独立开关
 // @author       biliip
+// @updateURL   https://raw.githubusercontent.com/0xlxx/bilibili-extension/main/bilibili-ips.user.js
+// @downloadURL https://raw.githubusercontent.com/0xlxx/bilibili-extension/main/bilibili-ips.user.js
 // @match        https://*.bilibili.com/*
 // @grant        none
 // @run-at       document-end
