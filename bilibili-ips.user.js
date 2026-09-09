@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Bilibili 评论增强 - IP属地 & 粉丝数
 // @namespace    biliip
-// @version      2.3.0
+// @version      2.3.1
 // @description  在 Bilibili 评论区显示用户 IP 属地和粉丝数量，支持独立开关
 // @author       biliip
 // @updateURL   https://raw.githubusercontent.com/0xlxx/bilibili-extension/main/bilibili-ips.user.js
@@ -883,7 +883,19 @@
     }
 
     /** 组装收藏记录 */
-    function buildFavoriteRecord(data, page) {
+    /** 构建规范评论链接（与 B 站「复制评论链接」一致），用于从收藏跳转到具体评论 */
+    function buildCommentUrl(data) {
+        const rpid = data.rpid ? String(data.rpid) : '';
+        const vid = location.pathname.match(/^\/video\/([A-Za-z0-9]+)/);
+        if (vid && rpid) {
+            return location.origin + '/video/' + vid[1] +
+                '?comment_on=1&comment_root_id=' + rpid + '&share_tag=s_i#reply' + rpid;
+        }
+        // 其它页面（动态/opus 等）暂保留当前地址
+        return location.href;
+    }
+
+    function buildFavoriteRecord(data) {
         return {
             id: commentUniqueId(data),
             mid: data.mid,
@@ -892,7 +904,7 @@
             ctime: data.ctime,
             ip: data.ip,
             fans: data.fans || null,
-            page: page,
+            page: buildCommentUrl(data),
             saved_at: new Date().toISOString(),
         };
     }
@@ -906,7 +918,7 @@
                 favoriteIdSet.delete(id);
                 return { ok: true, action: 'removed' };
             } else {
-                const record = buildFavoriteRecord(data, location.href);
+                const record = buildFavoriteRecord(data);
                 await favPut(record);
                 favoriteIdSet.add(id);
                 return { ok: true, action: 'added' };
