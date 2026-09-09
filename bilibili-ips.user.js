@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Bilibili 评论增强 - IP属地 & 粉丝数
 // @namespace    biliip
-// @version      2.0.0
+// @version      2.1.0
 // @description  在 Bilibili 评论区显示用户 IP 属地和粉丝数量，支持独立开关
 // @author       biliip
 // @match        https://*.bilibili.com/*
@@ -18,7 +18,7 @@
 
     const STORAGE_KEY = 'bili-enhancer-settings';
 
-    const DEFAULT_SETTINGS = { showIp: true, showFans: true };
+    const DEFAULT_SETTINGS = { showIp: true, showFans: true, enableFavorite: true };
 
     const CONFIG = {
         enabledPages: ['video', 'space', 'dynamic'],
@@ -86,10 +86,21 @@
             // mid：从宿主元素 __data.member 获取用户 ID
             const hostData = root.host && root.host.__data;
             const mid = hostData?.member?.mid || null;
+            const uname = hostData?.member?.uname || null;
+            const content = hostData?.content?.message || hostData?.content?.text || null;
+            const ctime = hostData?.ctime || null;
+            const rpid = hostData?.rpid || null;
 
-            return { ip, mid: mid ? String(mid) : null };
+            return {
+                ip,
+                mid: mid ? String(mid) : null,
+                uname,
+                content,
+                ctime,
+                rpid,
+            };
         } catch (_e) {
-            return { ip: null, mid: null };
+            return { ip: null, mid: null, uname: null, content: null, ctime: null, rpid: null };
         }
     }
 
@@ -205,6 +216,7 @@
             :root {
                 --be-show-ip: inline-flex;
                 --be-show-fans: inline-flex;
+                --be-show-fav: inline-flex;
             }
 
             /* ── 通用 Badge ── */
@@ -546,6 +558,10 @@
             '--be-show-fans',
             settings.showFans ? 'inline-flex' : 'none'
         );
+        document.documentElement.style.setProperty(
+            '--be-show-fav',
+            settings.enableFavorite ? 'inline-flex' : 'none'
+        );
     }
 
     /**
@@ -613,6 +629,7 @@
         observer.observe(replyControlRoot, { childList: true, subtree: true });
 
         renderBadges(commentRoot, data, replyControlRoot);
+        addFavoriteButton(commentRoot, data, replyControlRoot);
     }
 
     /**
@@ -666,6 +683,319 @@
     // Module 9: 设置面板 UI
     // ═══════════════════════════════════════════════════════════════
 
+    // ═══════════════════════════════════════════════════════════════
+    // Module 8.5: 评论收藏功能（File System Access API）
+    // ═══════════════════════════════════════════════════════════════
+
+    const FAV_FILE_NAME = 'bilibili-favorites.json';
+    const FAV_FILE_TYPES = [{ description: 'JSON 收藏文件', accept: { 'application/json': ['.json'] } }];
+    const FAV_DB_NAME = 'bili-enhancer-fav';
+    const FAV_DB_STORE = 'files';
+    const FAV_LS_KEY = 'bili-enhancer-favorites';
+
+    let favoriteFileHandle = null;
+    let favoriteIdSet = new Set();   // 本会话已知的已收藏 id
+    let favoriteLoaded = false;      // 是否已从持久化初始化
+
+    /** 打开/创建收藏文件句柄的 IndexedDB */
+    function openFavDB() {
+        return new Promise((resolve, reject) => {
+            const req = indexedDB.open(FAV_DB_NAME, 1);
+            req.onupgradeneeded = () => {
+                if (!req.result.objectStoreNames.contains(FAV_DB_STORE)) {
+                    req.result.createObjectStore(FAV_DB_STORE);
+                }
+            };
+            req.onsuccess = () => resolve(req.result);
+            req.onerror = () => reject(req.error);
+        });
+    }
+
+    /** 将文件句柄持久化到 IndexedDB（FileSystemHandle 可结构化克隆） */
+    async function saveFavoriteHandle(handle) {
+        try {
+            const db = await openFavDB();
+            await new Promise((resolve, reject) => {
+                const tx = db.transaction(FAV_DB_STORE, 'readwrite');
+                tx.objectStore(FAV_DB_STORE).put(handle, 'favorite');
+                tx.oncomplete = resolve;
+                tx.onerror = () => reject(tx.error);
+            });
+            db.close();
+        } catch (_) { /* 忽略：无法持久化句柄时仅影响跨会话恢复 */ }
+    }
+
+    /** 从 IndexedDB 恢复文件句柄 */
+    async function loadFavoriteHandle() {
+        try {
+            const db = await openFavDB();
+            const handle = await new Promise((resolve, reject) => {
+                const tx = db.transaction(FAV_DB_STORE, 'readonly');
+                const req = tx.objectStore(FAV_DB_STORE).get('favorite');
+                req.onsuccess = () => resolve(req.result || null);
+                req.onerror = () => reject(req.error);
+            });
+            db.close();
+            return handle;
+        } catch (_) { return null; }
+    }
+
+    function hasFsAccessApi() {
+        return typeof window.showSaveFilePicker === 'function';
+    }
+
+    /** 确保拿到可读写的本地收藏文件句柄（需用户激活触发） */
+    async function ensureFavoriteFile() {
+        if (favoriteFileHandle) return favoriteFileHandle;
+
+        // 尝试从 IndexedDB 恢复并申请读写权限
+        const saved = await loadFavoriteHandle();
+        if (saved && typeof saved.requestPermission === 'function') {
+            try {
+                const perm = await saved.requestPermission({ mode: 'readwrite' });
+                if (perm === 'granted') {
+                    favoriteFileHandle = saved;
+                    return favoriteFileHandle;
+                }
+            } catch (_) { /* 权限被拒或不可用 */ }
+        }
+
+        if (!hasFsAccessApi()) return null;
+
+        const handle = await window.showSaveFilePicker({
+            suggestedName: FAV_FILE_NAME,
+            types: FAV_FILE_TYPES,
+        });
+        favoriteFileHandle = handle;
+        await saveFavoriteHandle(handle);
+        return handle;
+    }
+
+    /** 从文件读取收藏列表 */
+    async function readFavoriteFile(handle) {
+        try {
+            const file = await handle.getFile();
+            const text = await file.text();
+            if (!text.trim()) return [];
+            const data = JSON.parse(text);
+            return Array.isArray(data) ? data : [];
+        } catch (_) { return []; }
+    }
+
+    /** 写回收藏列表到文件 */
+    async function writeFavoriteFile(handle, list) {
+        const writable = await handle.createWritable();
+        await writable.write(JSON.stringify(list, null, 2));
+        await writable.close();
+    }
+
+    /** localStorage 兜底收藏列表（不支持 File System Access 的浏览器） */
+    function readLocalFavorites() {
+        try {
+            const arr = JSON.parse(localStorage.getItem(FAV_LS_KEY) || '[]');
+            return Array.isArray(arr) ? arr : [];
+        } catch (_) { return []; }
+    }
+
+    function saveLocalFavorites(list) {
+        try { localStorage.setItem(FAV_LS_KEY, JSON.stringify(list)); } catch (_) { /* ignore */ }
+    }
+
+    /** 生成评论唯一 id */
+    function commentUniqueId(data) {
+        if (data.rpid) return String(data.rpid);
+        return `${data.mid || 'anon'}-${data.ctime || 0}-${(data.content || '').slice(0, 20)}`;
+    }
+
+    /** 组装收藏记录 */
+    function buildFavoriteRecord(data, page) {
+        return {
+            id: commentUniqueId(data),
+            mid: data.mid,
+            uname: data.uname,
+            content: data.content,
+            ctime: data.ctime,
+            ip: data.ip,
+            fans: data.fans || null,
+            page: page,
+            saved_at: new Date().toISOString(),
+        };
+    }
+
+    /** 收藏 / 取消收藏一条评论 */
+    async function toggleFavorite(data) {
+        const id = commentUniqueId(data);
+
+        // ── File System Access API（优先） ──
+        if (hasFsAccessApi() || favoriteFileHandle) {
+            const handle = await ensureFavoriteFile();
+            if (!handle) return { ok: false, error: 'no-file' };
+            try {
+                const list = await readFavoriteFile(handle);
+                const idx = list.findIndex(c => c && c.id === id);
+                let action;
+                if (idx >= 0) {
+                    list.splice(idx, 1);
+                    favoriteIdSet.delete(id);
+                    action = 'removed';
+                } else {
+                    list.unshift(buildFavoriteRecord(data, location.href));
+                    favoriteIdSet.add(id);
+                    action = 'added';
+                }
+                await writeFavoriteFile(handle, list);
+                return { ok: true, action };
+            } catch (e) {
+                return { ok: false, error: String((e && e.message) || e) };
+            }
+        }
+
+        // ── localStorage 兜底 ──
+        const list = readLocalFavorites();
+        const idx = list.findIndex(c => c && c.id === id);
+        let action;
+        if (idx >= 0) {
+            list.splice(idx, 1);
+            favoriteIdSet.delete(id);
+            action = 'removed';
+        } else {
+            list.unshift(buildFavoriteRecord(data, location.href));
+            favoriteIdSet.add(id);
+            action = 'added';
+        }
+        saveLocalFavorites(list);
+        return { ok: true, action, local: true };
+    }
+
+    /** 初始化：恢复句柄 + 构建已收藏 id 集合 */
+    async function initFavoriteState() {
+        if (favoriteLoaded) return;
+        try {
+            if (hasFsAccessApi()) {
+                const saved = await loadFavoriteHandle();
+                if (saved) {
+                    favoriteFileHandle = saved;
+                    const list = await readFavoriteFile(saved);
+                    favoriteIdSet = new Set(list.map(c => c && c.id).filter(Boolean));
+                }
+            } else {
+                favoriteIdSet = new Set(readLocalFavorites().map(c => c && c.id).filter(Boolean));
+            }
+        } catch (_) { /* ignore */ }
+        favoriteLoaded = true;
+    }
+
+    /** 设置收藏按钮的已收藏视觉状态 */
+    function setFavButtonState(btn, faved) {
+        const svg = btn.querySelector('svg');
+        const color = faved ? '#f6c344' : '#9499a0';
+        btn.classList.toggle('be-faved', faved);
+        btn.title = faved ? '取消收藏' : '收藏评论';
+        if (svg) {
+            svg.style.stroke = color;
+            svg.style.fill = faved ? color : 'none';
+        }
+        btn.setAttribute('aria-pressed', faved ? 'true' : 'false');
+    }
+
+    /** 轻量提示条 */
+    function showFavToast(msg) {
+        let el = document.getElementById('be-fav-toast');
+        if (!el) {
+            el = document.createElement('div');
+            el.id = 'be-fav-toast';
+            el.style.cssText =
+                'position:fixed;bottom:60px;left:50%;transform:translateX(-50%);' +
+                'background:rgba(24,25,28,.92);color:#fff;padding:8px 16px;border-radius:8px;' +
+                'font-size:13px;z-index:100000;opacity:0;transition:opacity .2s ease;' +
+                'pointer-events:none;white-space:nowrap;box-shadow:0 4px 16px rgba(0,0,0,.2);';
+            document.body.appendChild(el);
+        }
+        el.textContent = msg;
+        el.style.opacity = '1';
+        clearTimeout(el._t);
+        el._t = setTimeout(() => { el.style.opacity = '0'; }, 2200);
+    }
+
+    /** 在评论操作栏插入收藏按钮 */
+    function addFavoriteButton(root, data, replyControlRoot) {
+        if (!settings.enableFavorite) return;
+        if (!data.mid) return;
+        if (replyControlRoot.querySelector('.be-fav-btn')) return;
+        if (!replyControlRoot.children || replyControlRoot.children.length === 0) return;
+
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        btn.className = 'be-fav-btn';
+        btn.setAttribute('aria-label', '收藏评论');
+        btn.innerHTML =
+            '<svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">' +
+            '<path d="M19 21l-7-5-7 5V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z"/>' +
+            '</svg>';
+
+        const s = btn.style;
+        s.display = 'var(--be-show-fav, inline-flex)';
+        s.alignItems = 'center';
+        s.justifyContent = 'center';
+        s.height = '22px';
+        s.width = '22px';
+        s.padding = '0';
+        s.marginRight = '6px';
+        s.marginLeft = '2px';
+        s.border = 'none';
+        s.background = 'transparent';
+        s.cursor = 'pointer';
+        s.flexShrink = '0';
+        s.verticalAlign = 'middle';
+
+        const svg = btn.querySelector('svg');
+        if (svg) {
+            svg.style.width = '14px';
+            svg.style.height = '14px';
+            svg.style.fill = 'none';
+            svg.style.stroke = '#9499a0';
+            svg.style.strokeWidth = '1.8';
+            svg.style.strokeLinecap = 'round';
+            svg.style.strokeLinejoin = 'round';
+            svg.style.transition = 'stroke .2s ease, fill .2s ease';
+        }
+
+        setFavButtonState(btn, favoriteIdSet.has(commentUniqueId(data)));
+
+        btn.addEventListener('mouseenter', () => {
+            const c = btn.classList.contains('be-faved') ? '#f6c344' : '#ffb300';
+            if (svg) svg.style.stroke = c;
+        });
+        btn.addEventListener('mouseleave', () => {
+            setFavButtonState(btn, btn.classList.contains('be-faved'));
+        });
+
+        btn.addEventListener('click', async (e) => {
+            e.stopPropagation();
+            if (btn.disabled) return;
+            btn.disabled = true;
+            const res = await toggleFavorite(data);
+            btn.disabled = false;
+            if (res.ok) {
+                setFavButtonState(btn, res.action === 'added');
+                showFavToast(res.action === 'added'
+                    ? (res.local ? '已收藏（本地存储）' : '已收藏到本地文件')
+                    : '已取消收藏');
+            } else if (res.error === 'no-file') {
+                showFavToast('此浏览器不支持文件系统保存');
+            } else {
+                showFavToast('收藏失败：' + res.error);
+            }
+        });
+
+        // 插入：放在点赞按钮之前，或追加到操作栏末尾
+        if (replyControlRoot.children.like) {
+            replyControlRoot.insertBefore(btn, replyControlRoot.children.like);
+        } else {
+            replyControlRoot.appendChild(btn);
+        }
+    }
+
     function createSettingsUI() {
         // ── 浮动按钮 ──
         const btn = document.createElement('div');
@@ -695,6 +1025,15 @@
                 <span class="be-row-label">粉丝数量</span>
                 <label class="be-toggle">
                     <input type="checkbox" id="be-toggle-fans" ${settings.showFans ? 'checked' : ''}>
+                    <span class="be-toggle-track">
+                        <span class="be-toggle-thumb"></span>
+                    </span>
+                </label>
+            </div>
+            <div class="be-row">
+                <span class="be-row-label">评论收藏</span>
+                <label class="be-toggle">
+                    <input type="checkbox" id="be-toggle-fav" ${settings.enableFavorite ? 'checked' : ''}>
                     <span class="be-toggle-track">
                         <span class="be-toggle-thumb"></span>
                     </span>
@@ -741,6 +1080,13 @@
             saveSettings(settings);
             applyVisibility();
         });
+
+        // 评论收藏开关
+        panel.querySelector('#be-toggle-fav').addEventListener('change', function () {
+            settings.enableFavorite = this.checked;
+            saveSettings(settings);
+            applyVisibility();
+        });
     }
 
     // ═══════════════════════════════════════════════════════════════
@@ -753,6 +1099,7 @@
         injectStyles();
         applyVisibility(); // 应用初始可见性设置
         createSettingsUI();
+        initFavoriteState(); // 恢复收藏文件句柄与已收藏集合
 
         // 监听主题切换，重新着色粉丝 Badge
         new MutationObserver(() => {
