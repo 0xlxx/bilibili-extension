@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Bilibili 评论增强 - IP属地 & 粉丝数
 // @namespace    biliip
-// @version      2.1.0
+// @version      2.2.0
 // @description  在 Bilibili 评论区显示用户 IP 属地和粉丝数量，支持独立开关
 // @author       biliip
 // @match        https://*.bilibili.com/*
@@ -378,6 +378,24 @@
             .be-toggle input:checked + .be-toggle-track .be-toggle-thumb {
                 transform: translateX(16px);
             }
+
+            /* ── 导出收藏按钮 ── */
+            .be-export-btn {
+                margin-left: auto;
+                padding: 4px 12px;
+                font-size: 12px;
+                font-weight: 500;
+                color: color-mix(in srgb, var(--be-text) 85%, transparent);
+                background: color-mix(in srgb, var(--be-fan-base) 12%, transparent);
+                border: 0.5px solid color-mix(in srgb, var(--be-fan-base) 22%, transparent);
+                border-radius: 6px;
+                cursor: pointer;
+                transition: background .2s ease, transform .2s ease;
+            }
+            .be-export-btn:hover {
+                background: color-mix(in srgb, var(--be-fan-base) 20%, transparent);
+                transform: translateY(-1px);
+            }
         `;
         document.head.appendChild(style);
     }
@@ -684,121 +702,80 @@
     // ═══════════════════════════════════════════════════════════════
 
     // ═══════════════════════════════════════════════════════════════
-    // Module 8.5: 评论收藏功能（File System Access API）
-    // ═══════════════════════════════════════════════════════════════
+    // ─────────────────────────────────────────────────────────────
+    // 评论收藏：IndexedDB 无感存储 + 支持导出到本地文件
+    // ─────────────────────────────────────────────────────────────
 
-    const FAV_FILE_NAME = 'bilibili-favorites.json';
-    const FAV_FILE_TYPES = [{ description: 'JSON 收藏文件', accept: { 'application/json': ['.json'] } }];
     const FAV_DB_NAME = 'bili-enhancer-fav';
-    const FAV_DB_STORE = 'files';
-    const FAV_LS_KEY = 'bili-enhancer-favorites';
+    const FAV_DB_STORE = 'favorites';            // keyPath: id
+    const FAV_EXPORT_PREFIX = 'bilibili-favorites';
+    const FAV_EXPORT_TYPES = [{ description: 'JSON 收藏文件', accept: { 'application/json': ['.json'] } }];
 
-    let favoriteFileHandle = null;
-    let favoriteIdSet = new Set();   // 本会话已知的已收藏 id
-    let favoriteLoaded = false;      // 是否已从持久化初始化
+    let favoriteIdSet = new Set();               // 本会话已知的已收藏 id
+    let favoriteLoaded = false;                  // 是否已从 IndexedDB 初始化
+    let favDbPromise = null;
 
-    /** 打开/创建收藏文件句柄的 IndexedDB */
-    function openFavDB() {
-        return new Promise((resolve, reject) => {
-            const req = indexedDB.open(FAV_DB_NAME, 1);
-            req.onupgradeneeded = () => {
-                if (!req.result.objectStoreNames.contains(FAV_DB_STORE)) {
-                    req.result.createObjectStore(FAV_DB_STORE);
-                }
-            };
-            req.onsuccess = () => resolve(req.result);
-            req.onerror = () => reject(req.error);
-        });
-    }
-
-    /** 将文件句柄持久化到 IndexedDB（FileSystemHandle 可结构化克隆） */
-    async function saveFavoriteHandle(handle) {
-        try {
-            const db = await openFavDB();
-            await new Promise((resolve, reject) => {
-                const tx = db.transaction(FAV_DB_STORE, 'readwrite');
-                tx.objectStore(FAV_DB_STORE).put(handle, 'favorite');
-                tx.oncomplete = resolve;
-                tx.onerror = () => reject(tx.error);
-            });
-            db.close();
-        } catch (_) { /* 忽略：无法持久化句柄时仅影响跨会话恢复 */ }
-    }
-
-    /** 从 IndexedDB 恢复文件句柄 */
-    async function loadFavoriteHandle() {
-        try {
-            const db = await openFavDB();
-            const handle = await new Promise((resolve, reject) => {
-                const tx = db.transaction(FAV_DB_STORE, 'readonly');
-                const req = tx.objectStore(FAV_DB_STORE).get('favorite');
-                req.onsuccess = () => resolve(req.result || null);
+    /** 打开（或创建）收藏数据库 */
+    function openFavDb() {
+        if (!favDbPromise) {
+            favDbPromise = new Promise((resolve, reject) => {
+                const req = indexedDB.open(FAV_DB_NAME, 2);
+                req.onupgradeneeded = () => {
+                    const db = req.result;
+                    if (!db.objectStoreNames.contains(FAV_DB_STORE)) {
+                        db.createObjectStore(FAV_DB_STORE, { keyPath: 'id' });
+                    }
+                };
+                req.onsuccess = () => resolve(req.result);
                 req.onerror = () => reject(req.error);
             });
+        }
+        return favDbPromise;
+    }
+
+    /** 读取全部收藏 */
+    async function favGetAll() {
+        try {
+            const db = await openFavDb();
+            const list = await new Promise((resolve, reject) => {
+                const tx = db.transaction(FAV_DB_STORE, 'readonly');
+                const r = tx.objectStore(FAV_DB_STORE).getAll();
+                r.onsuccess = () => resolve(r.result || []);
+                r.onerror = () => reject(r.error);
+            });
             db.close();
-            return handle;
-        } catch (_) { return null; }
+            return list;
+        } catch (_) { return []; }
+    }
+
+    /** 写入单条收藏记录 */
+    async function favPut(record) {
+        const db = await openFavDb();
+        await new Promise((resolve, reject) => {
+            const tx = db.transaction(FAV_DB_STORE, 'readwrite');
+            tx.objectStore(FAV_DB_STORE).put(record);
+            tx.oncomplete = resolve;
+            tx.onerror = () => reject(tx.error);
+            tx.onabort = () => reject(tx.error);
+        });
+        db.close();
+    }
+
+    /** 删除单条收藏记录 */
+    async function favDelete(id) {
+        const db = await openFavDb();
+        await new Promise((resolve, reject) => {
+            const tx = db.transaction(FAV_DB_STORE, 'readwrite');
+            tx.objectStore(FAV_DB_STORE).delete(id);
+            tx.oncomplete = resolve;
+            tx.onerror = () => reject(tx.error);
+            tx.onabort = () => reject(tx.error);
+        });
+        db.close();
     }
 
     function hasFsAccessApi() {
         return typeof window.showSaveFilePicker === 'function';
-    }
-
-    /** 确保拿到可读写的本地收藏文件句柄（需用户激活触发） */
-    async function ensureFavoriteFile() {
-        if (favoriteFileHandle) return favoriteFileHandle;
-
-        // 尝试从 IndexedDB 恢复并申请读写权限
-        const saved = await loadFavoriteHandle();
-        if (saved && typeof saved.requestPermission === 'function') {
-            try {
-                const perm = await saved.requestPermission({ mode: 'readwrite' });
-                if (perm === 'granted') {
-                    favoriteFileHandle = saved;
-                    return favoriteFileHandle;
-                }
-            } catch (_) { /* 权限被拒或不可用 */ }
-        }
-
-        if (!hasFsAccessApi()) return null;
-
-        const handle = await window.showSaveFilePicker({
-            suggestedName: FAV_FILE_NAME,
-            types: FAV_FILE_TYPES,
-        });
-        favoriteFileHandle = handle;
-        await saveFavoriteHandle(handle);
-        return handle;
-    }
-
-    /** 从文件读取收藏列表 */
-    async function readFavoriteFile(handle) {
-        try {
-            const file = await handle.getFile();
-            const text = await file.text();
-            if (!text.trim()) return [];
-            const data = JSON.parse(text);
-            return Array.isArray(data) ? data : [];
-        } catch (_) { return []; }
-    }
-
-    /** 写回收藏列表到文件 */
-    async function writeFavoriteFile(handle, list) {
-        const writable = await handle.createWritable();
-        await writable.write(JSON.stringify(list, null, 2));
-        await writable.close();
-    }
-
-    /** localStorage 兜底收藏列表（不支持 File System Access 的浏览器） */
-    function readLocalFavorites() {
-        try {
-            const arr = JSON.parse(localStorage.getItem(FAV_LS_KEY) || '[]');
-            return Array.isArray(arr) ? arr : [];
-        } catch (_) { return []; }
-    }
-
-    function saveLocalFavorites(list) {
-        try { localStorage.setItem(FAV_LS_KEY, JSON.stringify(list)); } catch (_) { /* ignore */ }
     }
 
     /** 生成评论唯一 id */
@@ -822,67 +799,75 @@
         };
     }
 
-    /** 收藏 / 取消收藏一条评论 */
+    /** 收藏 / 取消收藏一条评论（无感写入 IndexedDB） */
     async function toggleFavorite(data) {
         const id = commentUniqueId(data);
-
-        // ── File System Access API（优先） ──
-        if (hasFsAccessApi() || favoriteFileHandle) {
-            const handle = await ensureFavoriteFile();
-            if (!handle) return { ok: false, error: 'no-file' };
-            try {
-                const list = await readFavoriteFile(handle);
-                const idx = list.findIndex(c => c && c.id === id);
-                let action;
-                if (idx >= 0) {
-                    list.splice(idx, 1);
-                    favoriteIdSet.delete(id);
-                    action = 'removed';
-                } else {
-                    list.unshift(buildFavoriteRecord(data, location.href));
-                    favoriteIdSet.add(id);
-                    action = 'added';
-                }
-                await writeFavoriteFile(handle, list);
-                return { ok: true, action };
-            } catch (e) {
-                return { ok: false, error: String((e && e.message) || e) };
+        try {
+            if (favoriteIdSet.has(id)) {
+                await favDelete(id);
+                favoriteIdSet.delete(id);
+                return { ok: true, action: 'removed' };
+            } else {
+                const record = buildFavoriteRecord(data, location.href);
+                await favPut(record);
+                favoriteIdSet.add(id);
+                return { ok: true, action: 'added' };
             }
+        } catch (e) {
+            return { ok: false, error: String((e && e.message) || e) };
         }
-
-        // ── localStorage 兜底 ──
-        const list = readLocalFavorites();
-        const idx = list.findIndex(c => c && c.id === id);
-        let action;
-        if (idx >= 0) {
-            list.splice(idx, 1);
-            favoriteIdSet.delete(id);
-            action = 'removed';
-        } else {
-            list.unshift(buildFavoriteRecord(data, location.href));
-            favoriteIdSet.add(id);
-            action = 'added';
-        }
-        saveLocalFavorites(list);
-        return { ok: true, action, local: true };
     }
 
-    /** 初始化：恢复句柄 + 构建已收藏 id 集合 */
+    /** 初始化：从 IndexedDB 读取已收藏 id 集合 */
     async function initFavoriteState() {
         if (favoriteLoaded) return;
         try {
-            if (hasFsAccessApi()) {
-                const saved = await loadFavoriteHandle();
-                if (saved) {
-                    favoriteFileHandle = saved;
-                    const list = await readFavoriteFile(saved);
-                    favoriteIdSet = new Set(list.map(c => c && c.id).filter(Boolean));
-                }
-            } else {
-                favoriteIdSet = new Set(readLocalFavorites().map(c => c && c.id).filter(Boolean));
-            }
+            const list = await favGetAll();
+            favoriteIdSet = new Set(list.map(c => c && c.id).filter(Boolean));
         } catch (_) { /* ignore */ }
         favoriteLoaded = true;
+    }
+
+    /** 导出收藏到本地文件（优先 File System Access API，降级为下载） */
+    async function exportFavorites() {
+        const list = await favGetAll();
+        if (!list.length) {
+            showFavToast('暂无收藏可导出');
+            return;
+        }
+        const d = new Date();
+        const pad = n => String(n).padStart(2, '0');
+        const filename = `${FAV_EXPORT_PREFIX}-${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}-${pad(d.getHours())}${pad(d.getMinutes())}.json`;
+        const json = JSON.stringify(list, null, 2);
+
+        if (hasFsAccessApi()) {
+            try {
+                const handle = await window.showSaveFilePicker({
+                    suggestedName: filename,
+                    types: FAV_EXPORT_TYPES,
+                });
+                const writable = await handle.createWritable();
+                await writable.write(json);
+                await writable.close();
+                showFavToast('已导出 ' + handle.name);
+                return;
+            } catch (e) {
+                // 用户取消或失败 → 回退到下载
+                if (e && e.name === 'AbortError') return; // 用户主动取消，静默
+            }
+        }
+
+        // 降级：触发浏览器下载
+        const blob = new Blob([json], { type: 'application/json' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = filename;
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        URL.revokeObjectURL(url);
+        showFavToast('已导出：' + filename);
     }
 
     /** 设置收藏按钮的已收藏视觉状态 */
@@ -917,7 +902,6 @@
         el._t = setTimeout(() => { el.style.opacity = '0'; }, 2200);
     }
 
-    /** 在评论操作栏插入收藏按钮 */
     function addFavoriteButton(root, data, replyControlRoot) {
         if (!settings.enableFavorite) return;
         if (!data.mid) return;
@@ -978,9 +962,7 @@
             btn.disabled = false;
             if (res.ok) {
                 setFavButtonState(btn, res.action === 'added');
-                showFavToast(res.action === 'added'
-                    ? (res.local ? '已收藏（本地存储）' : '已收藏到本地文件')
-                    : '已取消收藏');
+                showFavToast(res.action === 'added' ? '已收藏' : '已取消收藏');
             } else if (res.error === 'no-file') {
                 showFavToast('此浏览器不支持文件系统保存');
             } else {
@@ -1039,6 +1021,10 @@
                     </span>
                 </label>
             </div>
+            <div class="be-row">
+                <span class="be-row-label">导出收藏</span>
+                <button type="button" id="be-export-fav" class="be-export-btn">导出</button>
+            </div>
         `;
 
         document.body.appendChild(btn);
@@ -1086,6 +1072,15 @@
             settings.enableFavorite = this.checked;
             saveSettings(settings);
             applyVisibility();
+        });
+
+        // 导出收藏
+        panel.querySelector('#be-export-fav').addEventListener('click', async function () {
+            try {
+                await exportFavorites();
+            } catch (e) {
+                showFavToast('导出失败：' + ((e && e.message) || e));
+            }
         });
     }
 
